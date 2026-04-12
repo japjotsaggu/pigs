@@ -1,4 +1,4 @@
-# 🐷 PIGS: Physically Informed Gaussian Scenes
+# PIGS: Physically Informed Gaussian Scenes
 ### Physically Informed Gaussian Scenes for Geometry-Consistent 3D Generation
 
 <p align="center">
