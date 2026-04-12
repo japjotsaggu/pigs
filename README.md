@@ -6,8 +6,6 @@
 </p>
 
 <p align="center">
-  <a href="#"><img src="https://img.shields.io/badge/arXiv-coming%20soon-b31b1b.svg" alt="arXiv"/></a>
-  <a href="#"><img src="https://img.shields.io/badge/Project%20Page-coming%20soon-blue.svg" alt="Project Page"/></a>
   <a href="#license"><img src="https://img.shields.io/badge/license-MIT-green.svg" alt="License"/></a>
   <img src="https://img.shields.io/badge/python-3.10+-blue.svg" alt="Python"/>
   <img src="https://img.shields.io/badge/PyTorch-2.1+-orange.svg" alt="PyTorch"/>
