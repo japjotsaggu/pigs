@@ -1,0 +1,39 @@
+# Core
+torch>=2.1.0
+torchvision>=0.16.0
+numpy>=1.24.0
+Pillow>=10.0.0
+einops>=0.7.0
+tqdm>=4.65.0
+wandb>=0.15.0
+omegaconf>=2.3.0
+
+# 3D Gaussian Splatting
+gsplat>=1.0.0                  # CUDA-accelerated rasterizer (nerfstudio)
+plyfile>=0.9                   # PLY I/O for Gaussian checkpoints
+
+# Depth estimation
+# Depth-Pro: install from source
+# git clone https://github.com/apple/ml-depth-pro && pip install -e ml-depth-pro
+
+# Diffusion prior (Zero123++)
+diffusers>=0.27.0
+transformers>=4.38.0
+accelerate>=0.27.0
+
+# Physics evaluation
+pybullet>=3.2.6
+
+# Mesh extraction (for eval harness)
+open3d>=0.18.0
+trimesh>=4.0.0
+scikit-image>=0.21.0
+
+# Data
+opencv-python>=4.8.0
+imageio>=2.33.0
+imageio-ffmpeg>=0.4.9
+
+# Optional: visualization
+viser>=0.1.29                  # live 3DGS viewer in browser
+matplotlib>=3.7.0
