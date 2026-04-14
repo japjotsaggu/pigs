@@ -25,7 +25,7 @@ def load_depth_pro(device: str = "cuda") -> tuple:
     Lazy import so the rest of the project works even without the package.
     """
     try:
-        from depth_pro import create_model_and_transforms
+        from depth_pro.depth_pro import create_model_and_transforms
     except ImportError:
         raise ImportError(
             "ml-depth-pro not installed. "
