@@ -89,15 +89,17 @@ class GaussianScene(nn.Module):
         N = xyz.shape[0]
         xyz = xyz.to(self.device)
 
-        # Initial scale: mean distance to 3 nearest neighbours
+        # Initial scale: mean distance to 3 nearest neighbours, clamped tightly
         scales = self._estimate_initial_scales(xyz)  # (N, 3)
+        # Clamp to reasonable range for metric scenes
+        scales = scales.clamp(1e-4, 0.05)
 
         # Rotations: identity quaternion (w=1, x=y=z=0)
         rots = torch.zeros(N, 4, device=self.device)
         rots[:, 0] = 1.0
 
-        # Opacity: initialise to ~0.1 in sigmoid space
-        opacities = torch.full((N, 1), -2.0, device=self.device)  # sigmoid(-2) ≈ 0.12
+        # Opacity: sigmoid(-1) ≈ 0.27 — visible but not fully saturating
+        opacities = torch.full((N, 1), -1.0, device=self.device)
 
         # SH coefficients
         num_sh_rest = (self.sh_degree + 1) ** 2 - 1
@@ -122,13 +124,24 @@ class GaussianScene(nn.Module):
         print(f"[GaussianScene] Initialised {N:,} Gaussians from point cloud.")
 
     def _estimate_initial_scales(self, xyz: torch.Tensor) -> torch.Tensor:
-        """Estimate isotropic scale from mean kNN distance (k=3)."""
-        # Brute-force kNN on GPU — fine for up to ~500k points
-        dist2 = torch.cdist(xyz, xyz)
-        dist2.fill_diagonal_(float("inf"))
-        knn_dist, _ = dist2.topk(3, dim=1, largest=False)   # (N, 3)
-        mean_dist = knn_dist.mean(dim=1, keepdim=True).sqrt()  # (N, 1)
-        # Clamp to sane range
+        """Estimate isotropic scale from mean kNN distance (k=3).
+        Uses chunked computation to avoid OOM on large point clouds.
+        """
+        N = xyz.shape[0]
+        k = 3
+        chunk_size = 4096   # process this many query points at a time
+        mean_dists = []
+
+        for start in range(0, N, chunk_size):
+            end = min(start + chunk_size, N)
+            chunk = xyz[start:end]                          # (C, 3)
+            # distances from this chunk to all points
+            dist2 = torch.cdist(chunk, xyz)                 # (C, N)
+            dist2[:, start:end].fill_diagonal_(float("inf"))  # mask self
+            knn_dist2, _ = dist2.topk(k, dim=1, largest=False)  # (C, k)
+            mean_dists.append(knn_dist2.mean(dim=1).sqrt())     # (C,)
+
+        mean_dist = torch.cat(mean_dists, dim=0).unsqueeze(1)   # (N, 1)
         mean_dist = mean_dist.clamp(1e-4, 1.0)
         return mean_dist.expand(-1, 3)  # isotropic
 
@@ -203,8 +216,8 @@ class GaussianScene(nn.Module):
         colours = sh_to_rgb(self._features_dc.squeeze(1))  # (N, 3)
         colours = colours.clamp(0, 1)
 
-        # Camera
-        viewmat  = camera_matrix.unsqueeze(0)  # (1, 4, 4)
+        # Camera — gsplat expects world-to-camera matrix
+        viewmat = camera_matrix.unsqueeze(0)  # (1, 4, 4)
         Ks       = K.unsqueeze(0)              # (1, 3, 3)
 
         renders, alphas, meta = rasterization(
@@ -217,13 +230,16 @@ class GaussianScene(nn.Module):
             Ks=Ks,
             width=W,
             height=H,
-            backgrounds=bg_color.unsqueeze(0),
+            backgrounds=None,
             render_mode="RGB+D",
         )
 
         rgb   = renders[0, ..., :3]   # (H, W, 3)
         depth = renders[0, ..., 3:4]  # (H, W, 1)
         alpha = alphas[0]             # (H, W, 1)
+
+        # Composite background colour manually: out = alpha * render + (1 - alpha) * bg
+        rgb = rgb + (1.0 - alpha) * bg_color.view(1, 1, 3)
 
         return {"rgb": rgb, "alpha": alpha, "depth": depth, "meta": meta}
 
@@ -238,27 +254,30 @@ class GaussianScene(nn.Module):
         max_scale: float = 0.1,
         scene_extent: float = 1.0,
     ):
-        """
-        Clone under-reconstructed Gaussians, split over-large ones,
-        prune transparent ones. Matches §3.3 of the original 3DGS paper.
-        """
         grads = self._xyz_gradient_accum / self._denom.clamp(min=1)
         grads[grads.isnan()] = 0.0
+        grads = grads.squeeze()
 
-        # Clone: small Gaussians with high gradient
-        clone_mask = (grads.squeeze() >= max_grad) & \
+        # Clone first (small Gaussians, high grad)
+        clone_mask = (grads >= max_grad) & \
                      (self.scaling.max(dim=-1).values <= 0.01 * scene_extent)
+        self._clone_gaussians(clone_mask)
 
-        # Split: large Gaussians with high gradient
-        split_mask = (grads.squeeze() >= max_grad) & \
+        # Recompute grads for new N after clone
+        # Pad grads to match new size (cloned Gaussians inherit parent grad)
+        N_new = self._xyz.shape[0]
+        if N_new > grads.shape[0]:
+            pad = grads[clone_mask].repeat(1)[:N_new - grads.shape[0]]
+            grads = torch.cat([grads, pad], dim=0)
+
+        # Split (large Gaussians, high grad) — using updated N
+        split_mask = (grads >= max_grad) & \
                      (self.scaling.max(dim=-1).values > 0.01 * scene_extent)
+        self._split_gaussians(split_mask)
 
-        # Prune: low opacity or too large
+        # Prune — recompute on final N
         prune_mask = (self.opacity.squeeze() < min_opacity) | \
                      (self.scaling.max(dim=-1).values > max_scale * scene_extent)
-
-        self._clone_gaussians(clone_mask)
-        self._split_gaussians(split_mask)
         self._prune_gaussians(prune_mask)
 
         # Reset accumulators
@@ -267,8 +286,8 @@ class GaussianScene(nn.Module):
         self._denom              = torch.zeros(N, 1, device=self.device)
         self.max_radii2D         = torch.zeros(N,    device=self.device)
 
-        print(f"[Densify] {clone_mask.sum()} cloned, {split_mask.sum()} split, "
-              f"{prune_mask.sum()} pruned → {self.num_gaussians:,} total")
+        print(f"[Densify] cloned={clone_mask.sum()} split={split_mask.sum()} "
+              f"pruned={prune_mask.sum()} → {self.num_gaussians:,} total")
 
     def _clone_gaussians(self, mask: torch.Tensor):
         if not mask.any():
@@ -339,5 +358,3 @@ class GaussianScene(nn.Module):
         self._denom              = torch.zeros(N, 1, device=self.device)
         self.max_radii2D         = torch.zeros(N,    device=self.device)
         print(f"[GaussianScene] Loaded {N:,} Gaussians ← {path}")
-
-
