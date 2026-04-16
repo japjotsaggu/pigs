@@ -27,7 +27,7 @@ import numpy as np
 
 
 # ── project imports ─────────────────────────────────────────────────────────
-from depth.depth_pro          import load_depth_pro, image_to_pointcloud
+from depth.depth_infer          import load_depth_pro, image_to_pointcloud
 from gaussians.scene          import GaussianScene
 from diffusion.sds            import SDSLoss, SDSConfig, sample_random_camera
 from physics.regularizer      import PhysicsRegularizer, PhysicsConfig
@@ -118,11 +118,11 @@ class Trainer:
         self.n_iters          = args.iters
         self.densify_from     = 500
         self.densify_every    = 100
-        self.densify_until    = 15_000
-        self.opacity_reset_every = 3_000
-        self.sh_degree_every  = 1_000
+        self.densify_until    = 7_000   # was 15k — scaled to 10k run
+        self.opacity_reset_every = 2_000   # was 3k
+        self.sh_degree_every  = 800        # was 1k — still ramps SH through full degree
 
-        self.use_sds     = not args.no_sds
+        self.use_sds     = args.sds
         self.use_physics = not args.no_physics
 
     def setup(self):
@@ -145,18 +145,43 @@ class Trainer:
         print(f"      {pc['xyz'].shape[0]:,} points, "
               f"depth {pc['depth_map'].min():.2f}–{pc['depth_map'].max():.2f}m")
 
+        # Subsample point cloud if too large
+        max_points = 100_000
+        if pc['xyz'].shape[0] > max_points:
+            idx = torch.randperm(pc['xyz'].shape[0])[:max_points]
+            pc['xyz'] = pc['xyz'][idx]
+            if pc['rgb'] is not None:
+                pc['rgb'] = pc['rgb'][idx]
+            print(f"      Subsampled to {max_points:,} points")
+
         self.intrinsics = pc["intrinsics"].to(self.device)
         W_img, H_img   = self.input_image.size
-        self.H, self.W = H_img, W_img
+
+        # Downscale large images — 800px wide is plenty for 3DGS optimization
+        self.scale = min(1.0, 800.0 / max(W_img, H_img))
+        self.H = int(H_img * self.scale)
+        self.W = int(W_img * self.scale)
+
+        # Scale intrinsics to match render resolution
+        if self.scale < 1.0:
+            self.intrinsics = self.intrinsics.clone()
+            self.intrinsics[0, 0] *= self.scale   # fx
+            self.intrinsics[1, 1] *= self.scale   # fy
+            self.intrinsics[0, 2] *= self.scale   # cx
+            self.intrinsics[1, 2] *= self.scale   # cy
+
+        # Resize target image to match render resolution
+        import torch.nn.functional as F
+        target_np = np.array(self.input_image.resize((self.W, self.H),
+                             Image.BILINEAR)).astype(np.float32) / 255.0
+        self.target_rgb = torch.from_numpy(target_np).to(self.device)
+
+        print(f"      Render resolution: {self.W}×{self.H} (scale={self.scale:.2f})")
 
         # 3. Init Gaussian scene
         print("[3/4] Initialising Gaussian scene...")
         self.scene = GaussianScene(sh_degree=3, device=self.device)
         self.scene.init_from_pointcloud(pc["xyz"], pc["rgb"])
-
-        # Target image tensor (for photometric loss on input view)
-        rgb_np = np.array(self.input_image).astype(np.float32) / 255.0
-        self.target_rgb = torch.from_numpy(rgb_np).to(self.device)  # (H, W, 3)
 
         # 4. SDS + physics
         if self.use_sds:
@@ -172,7 +197,7 @@ class Trainer:
         # Optimiser
         self.optimiser = build_optimiser(self.scene, {
             "lr": {
-                "xyz":       1.6e-4,
+                "xyz":       1e-4,
                 "feat_dc":   1e-3,
                 "feat_rest": 5e-3,
                 "scaling":   5e-3,
@@ -210,6 +235,31 @@ class Trainer:
             )
             rgb_render = render["rgb"]   # (H, W, 3)
 
+            # Ensure target matches render size exactly
+            if self.target_rgb.shape[:2] != rgb_render.shape[:2]:
+                self.target_rgb = F.interpolate(
+                    self.target_rgb.permute(2,0,1).unsqueeze(0),
+                    size=rgb_render.shape[:2],
+                    mode="bilinear",
+                    align_corners=False,
+                ).squeeze(0).permute(1,2,0)
+
+            if step == 0:
+                import torchvision
+                torchvision.utils.save_image(rgb_render.permute(2,0,1).clamp(0,1), "debug_render_step0.png")
+                torchvision.utils.save_image(self.target_rgb.permute(2,0,1).clamp(0,1), "debug_target.png")
+                xyz = self.scene.xyz
+                op  = self.scene.opacity
+                sc  = self.scene.scaling
+                print(f"\n[DEBUG] xyz: X={xyz[:,0].min():.3f}~{xyz[:,0].max():.3f} "
+                      f"Y={xyz[:,1].min():.3f}~{xyz[:,1].max():.3f} "
+                      f"Z={xyz[:,2].min():.3f}~{xyz[:,2].max():.3f}")
+                print(f"[DEBUG] opacity: min={op.min():.4f} max={op.max():.4f} mean={op.mean():.4f}")
+                print(f"[DEBUG] scaling: min={sc.min():.6f} max={sc.max():.6f} mean={sc.mean():.6f}")
+                print(f"[DEBUG] alpha mean: {render['alpha'].mean().item():.6f}")
+                print(f"[DEBUG] N visible (op>0.05): {(op.squeeze()>0.05).sum().item()}")
+                print(f"[DEBUG] N in front (Z>0): {(xyz[:,2]>0).sum().item()}\n")
+
             # ── Photometric loss ───────────────────────────────
             loss_photo = photometric_loss(rgb_render, self.target_rgb)
 
@@ -237,7 +287,8 @@ class Trainer:
             loss_physics = torch.zeros(1, device=self.device)
             if self.use_physics and self.physics_reg is not None:
                 # Ramp in physics loss after initial warmup
-                if step > 1000:
+                # 300 steps = enough for Gaussians to find rough geometry first
+                if step > 300:
                     physics_losses = self.physics_reg(
                         xyz=self.scene.xyz,
                         scaling=self.scene.scaling,
@@ -248,7 +299,19 @@ class Trainer:
             # ── Total loss ─────────────────────────────────────
             loss = loss_photo + loss_sds + loss_physics
             loss.backward()
+
+            if step % 50 == 0:
+                grad = self.scene._xyz.grad
+                print(f"  [grad] xyz: {grad.abs().mean().item():.2e}" if grad is not None else "  [grad] xyz: None")
+
             self.optimiser.step()
+
+            # Exponential decay of xyz lr (3DGS paper: 1.6e-4 → 1.6e-6 over 30k steps)
+            # Scaled for our 10k run
+            for group in self.optimiser.param_groups:
+                if group.get("name") == "xyz":
+                    t = step / self.n_iters
+                    group["lr"] = 1e-4 * (1e-2 ** t)  # decays ~100x over full run
 
             # ── Adaptive density control ───────────────────────
             if (self.densify_from <= step < self.densify_until
@@ -320,13 +383,13 @@ class Trainer:
 
 def parse_args():
     p = argparse.ArgumentParser(description="Physics-consistent 3DGS trainer")
-    p.add_argument("--image",      required=True,         help="Input RGB image path")
-    p.add_argument("--output",     default="runs/exp_001",help="Output directory")
-    p.add_argument("--iters",      type=int, default=30_000)
+    p.add_argument("--image",      required=True,          help="Input RGB image path")
+    p.add_argument("--output",     default="runs/exp_001", help="Output directory")
+    p.add_argument("--iters",      type=int, default=10_000, help="Optimisation iterations (default 10k ≈ 45min on A40)")
     p.add_argument("--device",     default="cuda")
-    p.add_argument("--no-sds",     action="store_true",   help="Disable SDS (photometric only)")
-    p.add_argument("--no-physics", action="store_true",   help="Disable physics regularizer")
-    p.add_argument("--wandb",      action="store_true",   help="Log to Weights & Biases")
+    p.add_argument("--sds",        action="store_true",    help="Enable SDS via Zero123++ (adds ~4h, needs 48GB)")
+    p.add_argument("--no-physics", action="store_true",    help="Disable physics regularizer (baseline run)")
+    p.add_argument("--wandb",      action="store_true",    help="Log to Weights & Biases")
     return p.parse_args()
 
 
